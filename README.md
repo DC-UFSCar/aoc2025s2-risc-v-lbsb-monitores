@@ -1,3 +1,4 @@
+[![Open in Codespaces](https://classroom.github.com/assets/launch-codespace-2972f46106e565e64193e422d61a12cf1da4916b45550586e14ef0a7c637dd04.svg)](https://classroom.github.com/open-in-codespaces?assignment_repo_id=21963470)
 # Implementação de um RISC-V multiciclo com instruções LB/SB
 
 O [código fornecido a você](riscvmulti.sv) nesta simulação é uma implementação multiciclo do RISC-V, adaptada do código de Bruno Levy [^1]. 
