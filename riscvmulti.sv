@@ -9,13 +9,32 @@ module riscvmulti (
     output logic  halt = 0); 
 
     logic [31:0] instr, PC = 0;
+    
+    // guardar dados lidos da memoria
+    logic [31:0] mem_data_out; 
 
-    wire writeBackEn = // Quando se escreve no banco de registradores?
-    wire [31:0] writeBackData = // O que se escreve no banco de registradores?
-    wire [31:0] LoadStoreAddress = // Como se calcula o endereço de memória para loads e stores?
-    assign Address = // Qual o endereço de memória a ser acessado? Alternar entre .text e .data dependendo do estado
-    assign MemWrite = // Em que estado se escreve na memória?
-    assign WriteData = // O que se escreve na memória?
+    // EXECUTE -> intrucoes com resultado WAIT_DATA -> lw, dado vindo da memoria
+    // write-back de LOAD agora acontece no estado WB_LOAD
+    wire writeBackEn = (state == EXECUTE && (isALUreg || isALUimm || isLUI || isAUIPC || isJAL || isJALR)) || (state == WB_LOAD && isLoad);
+
+    // lw - LOAD_data_extracted jal/jalr - PCplus4 lui - Uimm ou ALUResult
+    wire [31:0] writeBackData = isLoad ? LOAD_data_extracted : 
+                                 isJAL || isJALR ? PCplus4 :
+                                 isLUI ? Uimm :
+                                 isAUIPC ? (PC - 4) + Uimm :
+                                 ALUResult;
+
+    // rs1 + deslocamento
+    wire [31:0] LoadStoreAddress = rs1 + (isStore ? Simm : Iimm);
+
+    // pode ser PC para instrucoes ou LoadStoreAddress para dados
+    assign Address = (state == FETCH_INSTR || state == WAIT_INSTR) ? PC : LoadStoreAddress;
+    
+    // apenas em estado STORE_WRITE
+    assign MemWrite = (state == STORE_WRITE);
+
+    // escreve a palavra toda modificada
+    assign WriteData = STORE_data_final;
 
     // The 10 RISC-V instructions
     wire isALUreg  =  (instr[6:0] == 7'b0110011); // rd <- rs1 OP rs2   
@@ -28,7 +47,6 @@ module riscvmulti (
     wire isLoad    =  (instr[6:0] == 7'b0000011); // rd <- mem[rs1+Iimm]
     wire isStore   =  (instr[6:0] == 7'b0100011); // mem[rs1+Simm] <- rs2
     wire isSYSTEM  =  (instr[6:0] == 7'b1110011); // special
-    wire isEBREAK  =  (isSYSTEM && (instr[14:12] == 3'b000));
 
     // The 5 immediate formats
     wire [31:0] Uimm={    instr[31],   instr[30:12], {12{1'b0}}};
@@ -46,14 +64,58 @@ module riscvmulti (
     wire [2:0] funct3 = instr[14:12];
     wire [6:0] funct7 = instr[31:25];
 
+    // https://github.com/BrunoLevy/learn-fpga/blob/master/FemtoRV/TUTORIALS/FROM_BLINKER_TO_RISCV/step20.v
+
+    wire mem_byteAccess     = funct3[1:0] == 2'b00;
+    wire mem_halfwordAccess = funct3[1:0] == 2'b01;
+
+    wire [15:0] LOAD_halfword =
+        LoadStoreAddress[1] ? mem_data_out[31:16] : mem_data_out[15:0];
+    wire  [7:0] LOAD_byte =
+        LoadStoreAddress[0] ? LOAD_halfword[15:8] : LOAD_halfword[7:0];
+    wire LOAD_sign =
+     !funct3[2] & (mem_byteAccess ? LOAD_byte[7] : LOAD_halfword[15]);
+    wire [31:0] LOAD_data_extracted =
+           mem_byteAccess ? {{24{LOAD_sign}},      LOAD_byte} :
+       mem_halfwordAccess ? {{16{LOAD_sign}}, LOAD_halfword} :
+                           mem_data_out ;
+
+    wire [3:0] STORE_wmask =
+           mem_byteAccess     ?
+             (LoadStoreAddress[1] ?
+               (LoadStoreAddress[0] ? 4'b1000 : 4'b0100) :
+               (LoadStoreAddress[0] ? 4'b0010 : 4'b0001)
+               ) :
+           mem_halfwordAccess ?
+             (LoadStoreAddress[1] ? 4'b1100 : 4'b0011) :
+             4'b1111;
+             
+    reg [31:0] STORE_data_final;
+    always @(*) begin
+      STORE_data_final = mem_data_out;
+      if (STORE_wmask[0]) STORE_data_final[ 7: 0] = rs2[7:0];
+      if (STORE_wmask[1]) STORE_data_final[15: 8] = rs2[7:0];
+      if (STORE_wmask[2]) STORE_data_final[23:16] = rs2[7:0];
+      if (STORE_wmask[3]) STORE_data_final[31:24] = rs2[7:0];
+
+      if (STORE_wmask == 4'b0011) STORE_data_final[15:0] = rs2[15:0];
+      if (STORE_wmask == 4'b1100) STORE_data_final[31:16] = rs2[15:0];
+
+      if (STORE_wmask == 4'b1111) STORE_data_final = rs2;
+    end
+
+    // https://github.com/BrunoLevy/learn-fpga/blob/master/FemtoRV/TUTORIALS/FROM_BLINKER_TO_RISCV/step20.v
+
     // The registers bank
     reg [31:0] RegisterBank [0:31];
     reg [31:0] rs1; // value of source
     reg [31:0] rs2; //  registers.
 
     // The ALU
-    wire [31:0] SrcA = rs1;
-    wire [31:0] SrcB = isALUreg | isBranch ? rs2 : Iimm;
+    wire [31:0] SrcA = (isAUIPC || isLUI) ? (PC - 4) : rs1;
+    wire [31:0] SrcB = (isALUreg || isBranch) ? rs2 : 
+                       (isStore) ? Simm : 
+                       (isLUI) ? Uimm : Iimm;
     wire [ 4:0] shamt  = isALUreg ? rs2[4:0] : instr[24:20]; // shift amount
 
     // The adder is used by both arithmetic instructions and JALR.
@@ -90,14 +152,14 @@ module riscvmulti (
     reg [31:0]  ALUResult;
     always @(*) begin
         case(funct3)
-            3'b000: ALUResult = (funct7[5] & instr[5]) ? aluMinus[31:0] : aluPlus;
+            3'b000: ALUResult = (funct7[5] & isALUreg) ? aluMinus[31:0] : aluPlus;
             3'b001: ALUResult = leftshift;
             3'b010: ALUResult = {31'b0, LT};
             3'b011: ALUResult = {31'b0, LTU};
             3'b100: ALUResult = (SrcA ^ SrcB);
             3'b101: ALUResult = shifter;
             3'b110: ALUResult = (SrcA | SrcB);
-            3'b111: ALUResult = (SrcA & SrcB);	
+            3'b111: ALUResult = (SrcA & SrcB);   
         endcase
     end
 
@@ -119,10 +181,10 @@ module riscvmulti (
     // An adder used to compute branch address, JAL address and AUIPC.
     // branch->PC+Bimm    AUIPC->PC+Uimm    JAL->PC+Jimm
     wire [31:0] PCplus4  = PC + 4;
-    wire [31:0] PCTarget = PC + (isJAL ? Jimm : isAUIPC ? Uimm : Bimm);
+    wire [31:0] PCTarget = (PC - 4) + (isJAL ? Jimm : isAUIPC ? Uimm : Bimm); 
     wire [31:0] PCNext = ((isBranch && takeBranch) || isJAL) ? PCTarget :
-                                                      isJALR ? {aluPlus[31:1],1'b0} :
-                                                               PCplus4;
+                                                 isJALR ? {aluPlus[31:1],1'b0} :
+                                                          PCplus4;
 
 
     // The state machine
@@ -130,61 +192,65 @@ module riscvmulti (
     localparam WAIT_INSTR  = 1;
     localparam FETCH_REGS  = 2;
     localparam EXECUTE     = 3;
-    localparam LOAD        = 4;
-    localparam WAIT_DATA   = 5;
-    localparam STORE       = 6;
+
+    localparam LOAD_READ     = 4; // LOAD
+    localparam WB_LOAD       = 5; // WAIT_DATA
+    localparam STORE_READ    = 6; // STORE
+    localparam STORE_WRITE   = 7; // novo estado
+    
     reg [2:0] state = FETCH_INSTR;
+    reg [2:0] nextstate; // proximo estado separado
+
+    always @(*) begin
+      case(state)
+        FETCH_INSTR: nextstate = WAIT_INSTR;
+        WAIT_INSTR:  nextstate = FETCH_REGS;
+        FETCH_REGS:  nextstate = EXECUTE;
+        EXECUTE:     if (isLoad)  nextstate = LOAD_READ;
+                     else if (isStore) nextstate = STORE_READ;
+                     else nextstate = FETCH_INSTR;
+        LOAD_READ:   nextstate = WB_LOAD;
+        WB_LOAD:     nextstate = FETCH_INSTR;
+        STORE_READ:  nextstate = STORE_WRITE;
+        STORE_WRITE: nextstate = FETCH_INSTR;
+        default:     nextstate = FETCH_INSTR;
+      endcase
+    end
 
     always @(posedge clk)
         if (reset) begin
             PC    <= 0;
             state <= FETCH_INSTR;
+            for (integer j = 0; j < 32; j = j + 1) begin
+                RegisterBank[j] <= 32'b0;
+            end
         end else begin
-            if (writeBackEn) begin
+            if (writeBackEn && rdId_A3 != 0) begin
                 RegisterBank[rdId_A3] <= writeBackData;
                 //$display("r%0d <= %b (%d) (%d)",rdId_A3,writeBackData,writeBackData,$signed(writeBackData));
             end
+            
+            state <= nextstate;
+
             case(state)
-                FETCH_INSTR: begin
-                    state <= WAIT_INSTR;
-                end
                 WAIT_INSTR: begin
                     instr <= ReadData;
-                    state <= FETCH_REGS;
                 end
                 FETCH_REGS: begin
                     rs1 <= rs1Id_A1 ? RegisterBank[rs1Id_A1] : 32'b0;
                     rs2 <= rs2Id_A2 ? RegisterBank[rs2Id_A2] : 32'b0;
-                    state <= EXECUTE;
                 end
                 EXECUTE: begin
-                    if (!isSYSTEM)
+                    if (!isSYSTEM) begin
                         PC <= PCNext;
-                    else
-                        if (isEBREAK) begin
-                            PC <= PC; // halt
-                            halt <= 1;
-                        end
-                    state <= isLoad  ? LOAD  : 
-                             isStore ? STORE : 
-                                       FETCH_INSTR;
+                    end
                 end
-                LOAD: begin
-                    state <= WAIT_DATA;
+                LOAD_READ: begin
+                    mem_data_out <= ReadData; 
                 end
-                WAIT_DATA: begin
-                    state <= FETCH_INSTR;
-                end
-                STORE: begin
-                    state <= FETCH_INSTR;
+                STORE_READ: begin
+                    mem_data_out <= ReadData;
                 end
             endcase 
         end
-
-    always @(posedge clk) begin
-        if (halt) begin
-            $writememh("regs.out", RegisterBank);
-            #10 $finish();
-        end
-    end
 endmodule
